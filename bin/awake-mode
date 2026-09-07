@@ -1,0 +1,117 @@
+#!/bin/bash
+# awake-mode: pick a mode, or print what is actually in effect.
+#
+#   awake-mode normal | lid | lock    select a mode
+#   awake-mode status                 print the current state (default)
+#
+# Selecting a mode only writes one word; the daemon makes it true within one
+# interval. That is what makes this safe to run over ssh from a phone.
+set -euo pipefail
+
+STATE_DIR="$HOME/Library/Application Support/awake-mode"
+MODE_FILE="$STATE_DIR/mode"
+STATUS_FILE="$STATE_DIR/status.json"
+STALE_AFTER_SEC=60
+
+case "$(/usr/bin/defaults read -g AppleLanguages 2>/dev/null | tr -d ' \n"()' | cut -d, -f1)" in
+  ja*) JA=1 ;;
+  *)   JA=0 ;;
+esac
+say()  { if [ "$JA" = 1 ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi; }
+pick() { if [ "$JA" = 1 ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+# The left column stays English: they are field names, and padding a mix of
+# Japanese and Latin text by character count never lines up in a terminal.
+row()  { printf '%-12s %s\n' "$1" "$2"; }
+
+usage() {
+  say "usage: awake-mode [normal|lid|lock|status]" "使い方: awake-mode [normal|lid|lock|status]"
+  say "  normal  leave sleep to macOS" "  normal  スリープは macOS 任せ"
+  say "  lid     keep running with the lid closed" "  lid     蓋を閉じても動かし続ける"
+  say "  lock    lock the screen, keep running" "  lock    画面をロックして動かし続ける"
+  say "  status  show what is in effect" "  status  今効いている状態を出す"
+}
+
+# The daemon writes status.json with a fixed key order, so sed is enough and the
+# CLI stays free of a JSON dependency.
+field() {   # field <key> ; numbers and booleans
+  sed -n 's/.*"'"$1"'":\([^,}"]*\).*/\1/p' "$STATUS_FILE" 2>/dev/null | head -1
+}
+text_field() {   # field <key> <next key> ; strings
+  sed -n 's/.*"'"$1"'":"\(.*\)","'"$2"'".*/\1/p' "$STATUS_FILE" 2>/dev/null | head -1
+}
+
+reason_text() {   # reason_text <code> <detail> <battery percent>
+  case "$1" in
+    "")                 say "" "" ;;
+    no_mode_file)       say "no mode file, treating as normal" "モードファイルが無いので normal 扱い" ;;
+    invalid_mode)       say "unknown mode '$2', treating as normal" "不正なモード '$2' なので normal 扱い" ;;
+    battery_guard)      say "battery at $3%, sleep prevention released" "電池 $3% のためスリープ防止を解除中" ;;
+    sudo_denied)        say "sudo was refused, check $2" "sudo が通らない ($2 を確認)" ;;
+    pmset_ineffective)  say "pmset returned success but nothing changed ($2)" "pmset は成功したが実値が変わらない ($2)" ;;
+    mismatch)           say "the wish and the machine disagree" "望みと現実が一致していない" ;;
+    stopped)            say "the watchdog has stopped" "見張りが停止した" ;;
+    *)                  printf '%s\n' "$1" ;;
+  esac
+}
+
+set_mode() {
+  mkdir -p "$STATE_DIR"
+  local tmp="$MODE_FILE.tmp.$$"
+  printf '%s\n' "$1" >"$tmp"
+  mv -f "$tmp" "$MODE_FILE"
+  say "mode: $1 (the watchdog applies it within one interval)" \
+      "モード: $1 (見張りが 1 周期のうちに反映します)"
+}
+
+show_status() {
+  if [ ! -r "$STATUS_FILE" ]; then
+    say "no status yet; is the watchdog installed and running?" \
+        "状態ファイルがありません。見張りが入っているか確認してください"
+    return 1
+  fi
+  local mode ok guard sd caf lpm pct src reason detail ts age
+  mode=$(text_field mode sleep_disabled)
+  ok=$(field ok)
+  guard=$(field battery_guard)
+  sd=$(field sleep_disabled)
+  caf=$(field caffeinate)
+  lpm=$(field low_power)
+  pct=$(field battery_percent)
+  src=$(text_field power_source reason)
+  reason=$(text_field reason detail)
+  detail=$(text_field detail ts)
+  ts=$(field ts)
+  # A truncated or half-written status file must read as ancient, not crash.
+  case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+  age=$(( $(date +%s) - ts ))
+
+  row mode "$mode"
+  if [ "$age" -gt "$STALE_AFTER_SEC" ]; then
+    row state "$(pick "STALE: no update for ${age}s, the watchdog is not running" \
+                      "古い: ${age} 秒 更新なし。見張りが動いていません")"
+  elif [ "$guard" = true ]; then
+    row state "$(pick "battery guard" "電池ガード")"
+  elif [ "$ok" = true ]; then
+    row state "$(pick "in effect" "効いています")"
+  else
+    row state "$(pick "NOT in effect" "効いていません")"
+  fi
+  if [ "$sd" = 1 ]; then row "lid close" "$(pick "stays awake" "閉じても起きたまま")"
+  else                   row "lid close" "$(pick "sleeps" "閉じたら寝る")"; fi
+  if [ "$caf" = true ]; then row "idle sleep" "$(pick "held off" "止めている")"
+  else                       row "idle sleep" "$(pick "allowed" "macOS 任せ")"; fi
+  if [ "$lpm" = 1 ]; then row "low power" "$(pick on 入)"
+  else                    row "low power" "$(pick off 切)"; fi
+  row battery "$pct% ($src)"
+  if [ -n "$reason" ]; then
+    row reason "$(reason_text "$reason" "$detail" "$pct")"
+  fi
+  [ "$age" -le "$STALE_AFTER_SEC" ] && [ "$ok" = true ]
+}
+
+case "${1:-status}" in
+  normal|lid|lock) set_mode "$1" ;;
+  status)          show_status ;;
+  -h|--help|help)  usage ;;
+  *)               usage; exit 2 ;;
+esac

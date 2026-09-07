@@ -1,0 +1,6 @@
+# Scratch directory the stubbed test suite builds and rebuilds
+.logic-check/
+
+# Locally built app bundle, if anyone builds one inside the checkout
+*.app/
+.DS_Store

@@ -1,0 +1,384 @@
+#!/bin/bash
+# awake-mode daemon: keeps the machine's real sleep behaviour equal to the one
+# selected mode, and publishes what is actually true.
+#
+#   mode (source of truth) : $STATE_DIR/mode          "normal" | "lid" | "lock"
+#   reported state         : $STATE_DIR/status.json   read by the menu bar app and the CLI
+#   settings               : $STATE_DIR/config        KEY=VALUE
+#   log                    : ~/Library/Logs/awake-mode.log
+#
+# `set -e` is deliberately absent: a failing pmset, a revoked sudo rule or a
+# missing file must be reported through status.json, not end the watchdog.
+set -u
+
+STATE_DIR="$HOME/Library/Application Support/awake-mode"
+LOG_DIR="$HOME/Library/Logs"
+MODE_FILE="$STATE_DIR/mode"
+STATUS_FILE="$STATE_DIR/status.json"
+CONFIG_FILE="$STATE_DIR/config"
+TEST_BATTERY_FILE="$STATE_DIR/test-battery"
+LOCK_DIR="$STATE_DIR/lock"
+LOG_FILE="$LOG_DIR/awake-mode.log"
+POWER_PLIST="/Library/Preferences/com.apple.PowerManagement.plist"
+
+DEFAULT_BATTERY_SLEEP_PERCENT=10
+DEFAULT_BATTERY_RESUME_PERCENT=15
+DEFAULT_LOW_POWER_ON_BATTERY=1
+DEFAULT_INTERVAL_SEC=10
+
+BATTERY_SLEEP_PERCENT=$DEFAULT_BATTERY_SLEEP_PERCENT
+BATTERY_RESUME_PERCENT=$DEFAULT_BATTERY_RESUME_PERCENT
+LOW_POWER_ON_BATTERY=$DEFAULT_LOW_POWER_ON_BATTERY
+INTERVAL_SEC=$DEFAULT_INTERVAL_SEC
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+# --- localisation -------------------------------------------------------------
+# The daemon only ever shows notifications; every other string it produces is a
+# machine readable code that the menu bar app and the CLI translate.
+locale_is_japanese() {
+  local langs
+  langs=$(/usr/bin/defaults read -g AppleLanguages 2>/dev/null | tr -d ' \n"()' | cut -d, -f1)
+  [ -z "$langs" ] && langs=$(/usr/bin/defaults read -g AppleLocale 2>/dev/null)
+  case "$langs" in ja*) return 0 ;; *) return 1 ;; esac
+}
+if locale_is_japanese; then JAPANESE=1; else JAPANESE=0; fi
+
+if [ "$JAPANESE" = 1 ]; then
+  MSG_TITLE="スリープ防止"
+  MSG_GUARD_OFF="電源が戻ったのでスリープ防止を再開しました"
+else
+  MSG_TITLE="Awake Mode"
+  MSG_GUARD_OFF="Power restored: sleep prevention resumed"
+fi
+
+guard_message() {   # $1 = battery percentage
+  if [ "$JAPANESE" = 1 ]; then
+    printf '電池残量 %s%% のためスリープ防止を解除しました (モードは維持)' "$1"
+  else
+    printf 'Battery at %s%%: sleep prevention released (mode kept)' "$1"
+  fi
+}
+
+now() { date '+%Y-%m-%d %H:%M:%S'; }
+log() { printf '%s %s\n' "$(now)" "$*" >>"$LOG_FILE"; }
+notify() {
+  /usr/bin/osascript -e "display notification \"$1\" with title \"$MSG_TITLE\"" >/dev/null 2>&1 || true
+}
+
+# --- single instance ----------------------------------------------------------
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  other=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+  if [ -n "${other:-}" ] && kill -0 "$other" 2>/dev/null; then
+    log "skip: another instance is running pid=$other"
+    sleep 30                      # KeepAlive would otherwise spin on this exit
+    exit 0
+  fi
+  rm -rf "$LOCK_DIR"              # stale directory from a SIGKILL; the pid is gone
+  mkdir "$LOCK_DIR" || { log "fail: cannot take the lock"; sleep 30; exit 1; }
+fi
+echo $$ >"$LOCK_DIR/pid"
+
+CAFFEINATE_PID=""
+
+# --- settings -----------------------------------------------------------------
+load_config() {
+  # Start from the defaults every time: the file is re-read while running, and
+  # a deleted line has to mean "back to the default", not "keep the old value".
+  BATTERY_SLEEP_PERCENT=$DEFAULT_BATTERY_SLEEP_PERCENT
+  BATTERY_RESUME_PERCENT=$DEFAULT_BATTERY_RESUME_PERCENT
+  LOW_POWER_ON_BATTERY=$DEFAULT_LOW_POWER_ON_BATTERY
+  INTERVAL_SEC=$DEFAULT_INTERVAL_SEC
+  [ -r "$CONFIG_FILE" ] || return 0
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=$(printf '%s' "${line%%=*}" | tr -d ' \t\r')
+    value=$(printf '%s' "${line#*=}" | tr -d ' \t\r')
+    case "$key" in
+      BATTERY_SLEEP_PERCENT|BATTERY_RESUME_PERCENT|INTERVAL_SEC)
+        case "$value" in ''|*[!0-9]*) continue ;; esac ;;
+      LOW_POWER_ON_BATTERY)
+        case "$value" in 0|1) ;; *) continue ;; esac ;;
+      *) continue ;;
+    esac
+    case "$key" in
+      BATTERY_SLEEP_PERCENT)  BATTERY_SLEEP_PERCENT="$value" ;;
+      BATTERY_RESUME_PERCENT) BATTERY_RESUME_PERCENT="$value" ;;
+      LOW_POWER_ON_BATTERY)   LOW_POWER_ON_BATTERY="$value" ;;
+      INTERVAL_SEC)           INTERVAL_SEC="$value" ;;
+    esac
+  done <"$CONFIG_FILE"
+  [ "$INTERVAL_SEC" -lt 1 ] && INTERVAL_SEC=1
+  # A resume threshold below the sleep threshold would flap the guard on and off.
+  [ "$BATTERY_RESUME_PERCENT" -lt "$BATTERY_SLEEP_PERCENT" ] &&
+    BATTERY_RESUME_PERCENT="$BATTERY_SLEEP_PERCENT"
+  return 0
+}
+
+# --- reading and writing the real state ---------------------------------------
+# Fast read, 12ms. pmset writes this plist back seconds after the call returns,
+# so a value that disagrees with the wish is not yet proof of anything.
+read_sleep_disabled() {
+  local v
+  v=$(/usr/bin/plutil -extract SystemPowerSettings.SleepDisabled raw "$POWER_PLIST" 2>/dev/null || true)
+  case "$v" in
+    true|1) echo 1 ;;
+    *)      echo 0 ;;             # false / 0 / absent / unreadable -> the safe side
+  esac
+}
+
+# Authoritative read, 160ms, straight from powerd. pmset omits the line entirely
+# when SleepDisabled is 0, so an empty result means 0.
+read_sleep_disabled_live() {
+  local v
+  v=$(/usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/{print $2; exit}')
+  case "$v" in
+    1|true) echo 1 ;;
+    *)      echo 0 ;;
+  esac
+}
+
+set_sleep_disabled() {
+  /usr/bin/sudo -n /usr/bin/pmset disablesleep "$1" >/dev/null 2>&1
+}
+
+# `pmset -g` reports the profile in use, so on AC it would never show what the
+# battery profile holds. `-g custom` lists both profiles regardless.
+read_low_power() {
+  /usr/bin/pmset -g custom 2>/dev/null | /usr/bin/awk '
+    /^Battery Power:/ { inbatt = 1; next }
+    /^[A-Za-z].*:/    { inbatt = 0 }
+    inbatt && $1 == "lowpowermode" { print ($2 == "1") ? 1 : 0; found = 1; exit }
+    END { if (!found) print 0 }'
+}
+
+set_low_power() {
+  /usr/bin/sudo -n /usr/bin/pmset -b lowpowermode "$1" >/dev/null 2>&1
+}
+
+caffeinate_alive() { [ -n "$CAFFEINATE_PID" ] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; }
+
+start_caffeinate() {
+  # -w $$ makes the child exit with us even after SIGKILL, so no orphaned
+  # assertion survives to keep the machine awake with nobody watching.
+  /usr/bin/caffeinate -i -w $$ &
+  CAFFEINATE_PID=$!
+  # Off the job table, or the shell prints "Terminated" into the error log every
+  # time the mode changes. kill -0 still finds the process.
+  disown "$CAFFEINATE_PID" 2>/dev/null || true
+}
+
+stop_caffeinate() {
+  if caffeinate_alive; then kill "$CAFFEINATE_PID" 2>/dev/null || true; fi
+  CAFFEINATE_PID=""
+}
+
+# --- the selected mode --------------------------------------------------------
+MODE=normal
+MODE_PROBLEM=""
+MODE_PROBLEM_DETAIL=""
+# Assigns MODE directly instead of echoing it: in a $(...) subshell the problem
+# flags set here would never reach the caller, and the anomaly would go unseen.
+read_mode() {
+  MODE_PROBLEM=""
+  MODE_PROBLEM_DETAIL=""
+  local m=""
+  # Test readability first: the shell's own redirection error is written to
+  # stderr before any 2>/dev/null on the command can suppress it.
+  [ -r "$MODE_FILE" ] && m=$(tr -d ' \t\r\n' <"$MODE_FILE")
+  case "$m" in
+    normal|lid|lock) MODE="$m" ;;
+    "")              MODE=normal; MODE_PROBLEM=no_mode_file ;;
+    *)               MODE=normal; MODE_PROBLEM=invalid_mode; MODE_PROBLEM_DETAIL="$m" ;;
+  esac
+}
+
+# --- battery ------------------------------------------------------------------
+BATTERY_PERCENT=100
+POWER_SOURCE=ac
+read_battery() {
+  if [ -f "$TEST_BATTERY_FILE" ]; then     # test injection, e.g. "5,battery"
+    local raw
+    raw=$(tr -d ' \t\r\n' <"$TEST_BATTERY_FILE" 2>/dev/null || true)
+    BATTERY_PERCENT="${raw%%,*}"
+    POWER_SOURCE="${raw##*,}"
+    case "$BATTERY_PERCENT" in ''|*[!0-9]*) BATTERY_PERCENT=100 ;; esac
+    case "$POWER_SOURCE" in ac|battery) ;; *) POWER_SOURCE=ac ;; esac
+    return
+  fi
+  local out pct
+  out=$(/usr/bin/pmset -g batt 2>/dev/null || true)
+  case "$out" in
+    *"'Battery Power'"*) POWER_SOURCE=battery ;;
+    *)                   POWER_SOURCE=ac ;;
+  esac
+  pct=$(printf '%s\n' "$out" | /usr/bin/awk 'match($0,/[0-9]+%/){print substr($0,RSTART,RLENGTH-1); exit}')
+  case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
+  BATTERY_PERCENT="$pct"
+}
+
+# --- status file --------------------------------------------------------------
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# The key order is fixed; the CLI parses this file with sed rather than pulling
+# in a JSON dependency for a status line.
+write_status() {   # mode sleep_disabled caffeinate low_power ok guard reason detail
+  local tmp="$STATUS_FILE.tmp.$$"
+  printf '{"mode":"%s","sleep_disabled":%s,"caffeinate":%s,"low_power":%s,"ok":%s,"battery_guard":%s,"battery_percent":%s,"power_source":"%s","reason":"%s","detail":"%s","ts":%s}\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$BATTERY_PERCENT" "$POWER_SOURCE" \
+    "$(json_escape "$7")" "$(json_escape "$8")" "$(date +%s)" >"$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$STATUS_FILE"
+}
+
+# --- shutdown -----------------------------------------------------------------
+shutdown_daemon() {
+  trap - TERM INT EXIT
+  stop_caffeinate
+  set_sleep_disabled 0 || true     # dying with SleepDisabled=1 cooks the machine in a bag
+  # Only while we own the setting; with LOW_POWER_ON_BATTERY=0 it is the owner's.
+  [ "$LOW_POWER_ON_BATTERY" = 1 ] && { set_low_power 0 || true; }
+  # Low power is reported as 0 either because we just turned it off or because
+  # we never managed it; both mean "not something awake-mode is holding on".
+  write_status "${MODE:-normal}" "$(read_sleep_disabled_live)" false 0 false false stopped ""
+  log "stop: caffeinate killed, disablesleep back to 0"
+  rm -rf "$LOCK_DIR"
+  exit 0
+}
+trap shutdown_daemon TERM INT
+trap 'rm -rf "$LOCK_DIR"' EXIT
+
+load_config
+log "start: pid=$$ interval=${INTERVAL_SEC}s battery_sleep=${BATTERY_SLEEP_PERCENT}% battery_resume=${BATTERY_RESUME_PERCENT}% low_power=${LOW_POWER_ON_BATTERY}"
+
+# --- main loop ----------------------------------------------------------------
+LAST_LOG_LINE=""
+LAST_CONFIG_LINE=""
+GUARD=false
+GUARD_NOTIFIED=false
+
+# Remember the mode we started in, so a machine rebooting into lock does not
+# blank its screen on every login (only a transition into lock does that).
+read_mode
+PREVIOUS_MODE="$MODE"
+
+while :; do
+  load_config
+  config_line="interval=$INTERVAL_SEC battery_sleep=$BATTERY_SLEEP_PERCENT battery_resume=$BATTERY_RESUME_PERCENT low_power=$LOW_POWER_ON_BATTERY"
+  if [ -n "$LAST_CONFIG_LINE" ] && [ "$config_line" != "$LAST_CONFIG_LINE" ]; then
+    log "config: $config_line"
+  fi
+  LAST_CONFIG_LINE="$config_line"
+
+  read_mode
+  read_battery      # 10ms; cheap enough that a stale reading is not worth a cache
+
+  case "$MODE" in
+    lid)  want_sd=1; want_caffeinate=1 ;;
+    lock) want_sd=0; want_caffeinate=1 ;;
+    *)    want_sd=0; want_caffeinate=0 ;;
+  esac
+
+  # Battery guard: below the threshold on battery power, drop everything that
+  # keeps the machine up so it sleeps on the owner's normal macOS settings.
+  # The selected mode is kept, so it resumes by itself once power returns.
+  if [ "$MODE" != normal ] && [ "$POWER_SOURCE" = battery ] &&
+     [ "$BATTERY_PERCENT" -lt "$BATTERY_SLEEP_PERCENT" ]; then
+    GUARD=true
+  elif [ "$GUARD" = true ] &&
+       { [ "$POWER_SOURCE" = ac ] || [ "$BATTERY_PERCENT" -ge "$BATTERY_RESUME_PERCENT" ]; }; then
+    GUARD=false
+  fi
+  if [ "$GUARD" = true ]; then
+    want_sd=0
+    want_caffeinate=0
+    if [ "$GUARD_NOTIFIED" = false ]; then
+      notify "$(guard_message "$BATTERY_PERCENT")"
+      GUARD_NOTIFIED=true
+    fi
+  elif [ "$GUARD_NOTIFIED" = true ]; then
+    notify "$MSG_GUARD_OFF"
+    GUARD_NOTIFIED=false
+  fi
+
+  reason=""
+  detail=""
+  if [ -n "$MODE_PROBLEM" ]; then reason="$MODE_PROBLEM"; detail="$MODE_PROBLEM_DETAIL"; fi
+  if [ "$GUARD" = true ]; then reason=battery_guard; detail=""; fi
+
+  # Read the fast source first and only ask powerd when it disagrees. Treating
+  # the plist's lag as "not in effect" used to turn the menu red for ten seconds
+  # after every switch, and made the daemon re-issue a pmset that had worked.
+  have_sd=$(read_sleep_disabled)
+  if [ "$have_sd" != "$want_sd" ]; then
+    have_sd=$(read_sleep_disabled_live)
+    if [ "$have_sd" != "$want_sd" ]; then
+      if set_sleep_disabled "$want_sd"; then
+        have_sd=$(read_sleep_disabled_live)
+        if [ "$have_sd" != "$want_sd" ]; then
+          reason=pmset_ineffective
+          detail="SleepDisabled stayed $have_sd"
+        fi
+      else
+        reason=sudo_denied
+        detail="/etc/sudoers.d/awake-mode"
+        have_sd=$(read_sleep_disabled_live)
+      fi
+    fi
+  fi
+
+  # Low power mode. While enabled, awake-mode owns the battery profile's value:
+  # 1 exactly while a keep-awake mode runs on battery, 0 otherwise. Disable it in
+  # the config to keep that setting to yourself.
+  if [ "$LOW_POWER_ON_BATTERY" = 1 ]; then
+    if [ "$MODE" != normal ] && [ "$POWER_SOURCE" = battery ]; then want_low_power=1; else want_low_power=0; fi
+    have_low_power=$(read_low_power)
+    if [ "$have_low_power" != "$want_low_power" ]; then
+      if set_low_power "$want_low_power"; then
+        have_low_power=$(read_low_power)
+      elif [ -z "$reason" ]; then
+        reason=sudo_denied
+        detail="/etc/sudoers.d/awake-mode"
+      fi
+    fi
+  else
+    have_low_power=0
+  fi
+
+  if [ "$want_caffeinate" = 1 ]; then
+    caffeinate_alive || start_caffeinate
+  else
+    caffeinate_alive && stop_caffeinate
+  fi
+  if caffeinate_alive; then have_caffeinate=true; else have_caffeinate=false; fi
+
+  want_caffeinate_bool=false
+  [ "$want_caffeinate" = 1 ] && want_caffeinate_bool=true
+  if [ "$have_sd" = "$want_sd" ] && [ "$have_caffeinate" = "$want_caffeinate_bool" ]; then ok=true; else ok=false; fi
+  [ "$ok" = false ] && [ -z "$reason" ] && reason=mismatch
+
+  write_status "$MODE" "$have_sd" "$have_caffeinate" "$have_low_power" "$ok" "$GUARD" "$reason" "$detail"
+
+  log_line="mode=$MODE sd=$have_sd caf=$have_caffeinate lpm=$have_low_power ok=$ok guard=$GUARD reason=$reason detail=$detail"
+  if [ "$log_line" != "$LAST_LOG_LINE" ]; then
+    log "$log_line"
+    LAST_LOG_LINE="$log_line"
+  fi
+
+  # Entering lock has to blank the screen by hand: on AC many Macs ship
+  # displaysleep=0, and a display that never sleeps never reaches the lock
+  # screen. Only the transition does this, so the mode can be left on while
+  # the owner comes back and keeps working.
+  if [ "$MODE" = lock ] && [ "$PREVIOUS_MODE" != lock ]; then
+    /usr/bin/pmset displaysleepnow >/dev/null 2>&1
+    log "lock: displaysleepnow"
+  fi
+  PREVIOUS_MODE="$MODE"
+
+  # A foreground sleep defers the TERM trap until it returns, and launchctl
+  # bootout sends SIGKILL a few seconds after SIGTERM: the cleanup would never
+  # run and SleepDisabled=1 would survive the daemon.
+  sleep "$INTERVAL_SEC" &
+  wait $!
+done
