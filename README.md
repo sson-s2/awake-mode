@@ -77,6 +77,14 @@ CLI も、この 1 語を書く以外のことをしない。常駐の見張り 
 `status.json` に書く。アイコンと `awake-mode status` はその実状態を読む。だから「選んだのに
 効いていない」があれば赤くなって見える。見張りが kill されても launchd が上げ直す。
 
+## 電源につないでいない時
+
+| モード | バッテリ駆動中 | 10% を切ったら | 電源を挿したら |
+|---|---|---|---|
+| `lid` | 蓋を閉じても起きたまま。画面は消え、低電力モードが自動で入る | 蓋の設定も `caffeinate` も外して普通に寝る。モードの選択は残る | 自動で戻る。低電力モードは切れる |
+| `lock` | 蓋を開けたまま起きたまま。低電力モードが自動で入る | 同上 | 同上 |
+| `normal` | いつもの Mac | 変化なし | 変化なし |
+
 ## 安全のための作り
 
 - **電池が減ったら普通に寝る** — バッテリ駆動で 10% を切ると、蓋の設定も `caffeinate` も
@@ -216,6 +224,14 @@ every ten seconds, reads the real `pmset disablesleep` value and its own
 `status.json`. The icon and `awake-mode status` read that file, which is why a
 mode that is not taking effect shows up red instead of silently doing nothing.
 If the watchdog is killed, launchd starts it again.
+
+## On battery
+
+| Mode | While on battery | Below 10% | When plugged in again |
+|---|---|---|---|
+| `lid` | Stays awake with the lid closed; the display goes dark and Low Power Mode turns on | Releases both the lid setting and `caffeinate` and sleeps normally; the mode selection is kept | Resumes automatically; Low Power Mode turns off |
+| `lock` | Stays awake with the lid open; Low Power Mode turns on | Same | Same |
+| `normal` | An ordinary Mac | No change | No change |
 
 ## Built to fail safe
 
