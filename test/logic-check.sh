@@ -94,7 +94,19 @@ check() {
   if [ "$2" = "$3" ]; then echo "  ok   $1 ($2)"; PASS=$((PASS+1))
   else echo "  NG   $1: expected $3, got $2"; FAIL=$((FAIL+1)); fi
 }
-settle() { sleep 3; }
+# Wait for two status writes, so the second cycle has certainly read what the
+# test just wrote. A fixed sleep was flaky on a loaded machine: one cycle takes
+# over a second there, and three seconds did not always cover two of them.
+# Capped, so a dead daemon fails its checks instead of hanging the run.
+settle() {
+  local before seen=0 waited=0 m
+  before=$(stat -f %Fm "$STATUS" 2>/dev/null)
+  while [ "$seen" -lt 2 ] && [ "$waited" -lt 200 ]; do
+    sleep 0.1; waited=$((waited+1))
+    m=$(stat -f %Fm "$STATUS" 2>/dev/null)
+    if [ "$m" != "$before" ]; then seen=$((seen+1)); before=$m; fi
+  done
+}
 # The outside world moving the value: powerd and the plist both change.
 external_set() { echo "$1" >"$SD"; [ "$1" = true ] && echo 1 >"$LIVE" || echo 0 >"$LIVE"; }
 write_config() { printf '%s\n' "$@" >"$CONFIG"; }
@@ -272,7 +284,7 @@ echo "[21] SIGTERM lands at once even with a long interval"
 write_config "INTERVAL_SEC=30"
 echo lid >"$MODE_FILE"
 HOME="$FAKE_HOME" bash "$WORK/daemon.sh" &
-long=$!; sleep 3
+long=$!; settle
 check "lid took effect" "$(cat "$SD")" true
 started=$(date +%s); kill -TERM "$long"
 waited=0
@@ -288,18 +300,18 @@ write_config "INTERVAL_SEC=1"
 echo lock >"$MODE_FILE"                    # already in lock when it starts
 : >"$WORK/dsn_calls"
 HOME="$FAKE_HOME" bash "$WORK/daemon.sh" &
-last=$!; sleep 3
+last=$!; settle
 check "starting in lock does not blank" "$(count_dsn)" 0
-echo normal >"$MODE_FILE"; sleep 3; : >"$WORK/dsn_calls"
-echo lock >"$MODE_FILE"; sleep 3
+echo normal >"$MODE_FILE"; settle; : >"$WORK/dsn_calls"
+echo lock >"$MODE_FILE"; settle
 check "normal to lock blanks once" "$(count_dsn)" 1
-: >"$WORK/dsn_calls"; sleep 4
+: >"$WORK/dsn_calls"; settle
 check "staying in lock does not blank" "$(count_dsn)" 0
-echo lid >"$MODE_FILE"; sleep 3; : >"$WORK/dsn_calls"
-echo lock >"$MODE_FILE"; sleep 3
+echo lid >"$MODE_FILE"; settle; : >"$WORK/dsn_calls"
+echo lock >"$MODE_FILE"; settle
 check "lid to lock blanks once" "$(count_dsn)" 1
 : >"$WORK/dsn_calls"
-echo lid >"$MODE_FILE"; sleep 3
+echo lid >"$MODE_FILE"; settle
 check "leaving lock does not blank" "$(count_dsn)" 0
 check "one log line per blank" "$(( $(grep -c 'lock: displaysleepnow' "$LOG") - log_mark ))" 2
 kill -TERM "$last" 2>/dev/null; sleep 2
