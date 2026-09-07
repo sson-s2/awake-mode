@@ -106,7 +106,7 @@ show_status() {
   if [ -n "$reason" ]; then
     row reason "$(reason_text "$reason" "$detail" "$pct")"
   fi
-  [ "$age" -le "$STALE_AFTER_SEC" ] && [ "$ok" = true ]
+  [ "$age" -le "$STALE_AFTER_SEC" ] && [ "$ok" = true ] && [ "$guard" != true ]
 }
 
 case "${1:-status}" in

@@ -199,7 +199,10 @@ read_mode() {
 BATTERY_PERCENT=100
 POWER_SOURCE=ac
 read_battery() {
-  if [ -f "$TEST_BATTERY_FILE" ]; then     # test injection, e.g. "5,battery"
+  # Test injection, e.g. "5,battery". Only honoured while the file is under ten
+  # minutes old, so a test that crashed and left it behind cannot disarm the
+  # battery guard indefinitely.
+  if [ -n "$(find "$TEST_BATTERY_FILE" -mmin -10 2>/dev/null)" ]; then
     local raw
     raw=$(tr -d ' \t\r\n' <"$TEST_BATTERY_FILE" 2>/dev/null || true)
     BATTERY_PERCENT="${raw%%,*}"
@@ -246,7 +249,7 @@ shutdown_daemon() {
   rm -rf "$LOCK_DIR"
   exit 0
 }
-trap shutdown_daemon TERM INT
+trap shutdown_daemon TERM INT HUP
 trap 'rm -rf "$LOCK_DIR"' EXIT
 
 load_config

@@ -48,9 +48,17 @@ current_mode=""
 [ -r "$MODE_FILE" ] && current_mode=$(tr -d ' \t\r\n' <"$MODE_FILE")
 case "$current_mode" in lid) probe=1 ;; *) probe=0 ;; esac
 sudo -k
-# Both checks: a rule left behind by another tool can cover disablesleep alone,
-# which would skip writing the lowpowermode lines this daemon also needs.
-if [ -f "$SUDOERS_FILE" ] && sudo -n /usr/bin/pmset disablesleep "$probe" >/dev/null 2>&1; then
+# `sudo -l <cmd>` asks whether the rule covers the command without running it,
+# so all four are checked: a rule from an older version or another tool may
+# cover disablesleep alone and silently leave lowpowermode unusable.
+all_granted() {
+  local c
+  for c in "disablesleep 0" "disablesleep 1" "-b lowpowermode 0" "-b lowpowermode 1"; do
+    # shellcheck disable=SC2086
+    sudo -n -l /usr/bin/pmset $c >/dev/null 2>&1 || return 1
+  done
+}
+if [ -f "$SUDOERS_FILE" ] && all_granted; then
   echo "   already granted ($SUDOERS_FILE)"
 else
   draft=$(mktemp -t awake-mode.sudoers) || die "could not create a temporary file"

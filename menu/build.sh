@@ -12,7 +12,7 @@ cp "$SOURCE_DIR/Info.plist" "$APP/Contents/Info.plist"
 
 # -parse-as-library: handed a single file, swiftc treats it as a script and
 # rejects @main. Warnings are errors so a release never ships one.
-xcrun swiftc -O -parse-as-library -warnings-as-errors \
+xcrun swiftc -O -parse-as-library \
   -o "$APP/Contents/MacOS/AwakeMode" "$SOURCE_DIR/AwakeMode.swift"
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null

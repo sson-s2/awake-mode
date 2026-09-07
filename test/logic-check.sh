@@ -61,7 +61,7 @@ cat >"$WORK/stub/plutil" <<EOF
 cat "$SD"
 EOF
 
-# pmset -g omits SleepDisabled when it is 0, exactly like the real one.
+# pmset -g prints SleepDisabled 0 or 1 (older builds omitted the line at 0; the daemon accepts both).
 cat >"$WORK/stub/pmset" <<EOF
 #!/bin/bash
 case "\$*" in
@@ -70,7 +70,7 @@ case "\$*" in
     printf 'Battery Power:\n lowpowermode         %s\n displaysleep         5\nAC Power:\n lowpowermode         0\n displaysleep         0\n' "\$(cat "$LPM")" ;;
   *assertions*) pgrep -f 'logic-caffeinate' >/dev/null && echo "   caffeinate 1 (PreventUserIdleSystemSleep)" ;;
   *batt*)       cat "$WORK/batt" ;;
-  *)            [ "\$(cat "$LIVE")" = 1 ] && printf ' SleepDisabled\t\t1\n'; echo "Currently in use:" ;;
+  *)            printf ' SleepDisabled\t\t%s\n' "\$(cat "$LIVE")"; echo "Currently in use:" ;;
 esac
 exit 0
 EOF
